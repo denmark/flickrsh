@@ -13,13 +13,16 @@ var albumCmd = &cobra.Command{
 	Long:  "Get information about albums",
 	Run: func(cmd *cobra.Command, args []string) {
 		fmt.Println("album called")
-		initDb()
 		albumList()
 	},
 }
 
 func albumList() {
 	client := getFlickrClient()
+
+	if client == nil {
+		return
+	}
 
 	pages := 1
 	for page := 1; page <= pages; page++ {
