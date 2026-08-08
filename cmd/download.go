@@ -25,13 +25,16 @@ var downloadCmd = &cobra.Command{
 	Long:  "Download photo/video files from Flickr",
 	Run: func(cmd *cobra.Command, args []string) {
 		fmt.Println("download called")
-		initDb()
 		download()
 	},
 }
 
 func download() {
 	client := getFlickrClient()
+
+	if client == nil {
+		return
+	}
 
 	pages := 1
 	photoIdx := 0

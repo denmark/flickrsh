@@ -40,7 +40,6 @@ var uploadCmd = &cobra.Command{
 	Long:  "Upload one or more files to Flickr",
 	Run: func(cmd *cobra.Command, args []string) {
 		fmt.Println("upload called")
-		initDb()
 		upload(args)
 	},
 }
@@ -51,9 +50,13 @@ func upload(files []string) {
 	fmt.Printf("files: %v\n", files)
 
 	for i := 0; i < len(tags); i++ {
-		fmt.Printf("tag: %s", tags[i])
+		fmt.Printf("tag: %s\n", tags[i])
 	}
 	client := getFlickrClient()
+
+	if client == nil {
+		return
+	}
 
 	uploadParams := flickr.UploadParams{
 		Tags: tags,

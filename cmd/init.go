@@ -18,56 +18,87 @@ import (
 	"bufio"
 	"fmt"
 	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 
 	flickr "github.com/denmark/flickr"
 	flickr_test "github.com/denmark/flickr/test"
-	"github.com/jinzhu/gorm"
+	homedir "github.com/mitchellh/go-homedir"
 	"github.com/spf13/cobra"
-
-	_ "github.com/mattn/go-sqlite3" // SQLite driver
+	yaml "go.yaml.in/yaml/v3"
 )
 
-var db *gorm.DB
-
-type auth struct {
-	UserID           string `gorm:"type:varchar(25);primary key"`
-	APIKey           string `gorm:"type:varchar(50)"`
-	APISecret        string `gorm:"type:varchar(50)"`
-	OauthToken       string `gorm:"type:varchar(50)"`
-	OauthTokenSecret string `gorm:"type:varchar(50)"`
+type flickrConfig struct {
+	UserID           string `yaml:"user_id"`
+	APIKey           string `yaml:"api_key"`
+	APISecret        string `yaml:"api_secret"`
+	OauthToken       string `yaml:"oauth_token"`
+	OauthTokenSecret string `yaml:"oauth_token_secret"`
 }
 
 var flickrAPIKey string
 var flickrAPISecret string
 
-func initDb() {
-	var err error
-
-	db, err = gorm.Open("sqlite3", "flickrsh.db")
+// configFilePath returns the OS-appropriate path to the Flickr credentials
+// file, which lives in the user's home directory.
+func configFilePath() (string, error) {
+	home, err := homedir.Dir()
 	if err != nil {
-		panic(err)
+		return "", err
 	}
 
-	db.LogMode(true) // true gives SQL output
-	db.SingularTable(true)
-	db.AutoMigrate(&auth{})
-	fmt.Println("Initialized DB")
+	filename := ".flickrsh.yml"
+	if runtime.GOOS == "windows" {
+		filename = "flickrsh.yml"
+	}
+
+	return filepath.Join(home, filename), nil
+}
+
+func loadFlickrConfig() (*flickrConfig, error) {
+	path, err := configFilePath()
+	if err != nil {
+		return nil, err
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+
+	var cfg flickrConfig
+	if err := yaml.Unmarshal(data, &cfg); err != nil {
+		return nil, err
+	}
+
+	return &cfg, nil
+}
+
+func saveFlickrConfig(cfg *flickrConfig) error {
+	path, err := configFilePath()
+	if err != nil {
+		return err
+	}
+
+	data, err := yaml.Marshal(cfg)
+	if err != nil {
+		return err
+	}
+
+	return os.WriteFile(path, data, 0600)
 }
 
 func getFlickrClient() (client *flickr.FlickrClient) {
-	var flickrAuth auth
-
-	db.Take(&flickrAuth)
-
-	if flickrAuth.APIKey == "" {
-		fmt.Println("Flickr API not initialized, run 'init flickr --key <API Key> --secret <API Secret>'")
+	cfg, err := loadFlickrConfig()
+	if err != nil || cfg.APIKey == "" {
+		fmt.Println("Flickr API not initialized, run 'flickrsh init --key <API Key> --secret <API Secret>'")
 		return nil
 	}
 
-	client = flickr.NewFlickrClient(flickrAuth.APIKey, flickrAuth.APISecret)
-	client.OAuthToken = flickrAuth.OauthToken
-	client.OAuthTokenSecret = flickrAuth.OauthTokenSecret
+	client = flickr.NewFlickrClient(cfg.APIKey, cfg.APISecret)
+	client.OAuthToken = cfg.OauthToken
+	client.OAuthTokenSecret = cfg.OauthTokenSecret
 
 	return
 }
@@ -85,25 +116,45 @@ func initFlickr() {
 	oauthConfirmationCode, _ := reader.ReadString('\n')
 
 	accessToken, err := flickr.GetAccessToken(client, requestTok, strings.TrimSpace(oauthConfirmationCode))
-	if err == nil {
-		client.OAuthToken = accessToken.OAuthToken
-		client.OAuthTokenSecret = accessToken.OAuthTokenSecret
-
-		if resp, err := flickr_test.Login(client); err == nil {
-			var flickrAuth auth
-			db.Where(auth{UserID: resp.User.ID}).Assign(auth{
-				UserID:           resp.User.ID,
-				APIKey:           flickrAPIKey,
-				APISecret:        flickrAPISecret,
-				OauthToken:       client.OAuthToken,
-				OauthTokenSecret: client.OAuthTokenSecret,
-			}).FirstOrCreate(&flickrAuth)
-		} else {
-			fmt.Printf("Login to Flickr failed: %s\n", err)
-		}
-	} else {
+	if err != nil {
 		fmt.Println("Failed to initialize the Flickr connection!!!")
+		return
 	}
+
+	client.OAuthToken = accessToken.OAuthToken
+	client.OAuthTokenSecret = accessToken.OAuthTokenSecret
+
+	resp, err := flickr_test.Login(client)
+	if err != nil {
+		fmt.Printf("Login to Flickr failed: %s\n", err)
+		return
+	}
+
+	cfg := &flickrConfig{
+		UserID:           resp.User.ID,
+		APIKey:           flickrAPIKey,
+		APISecret:        flickrAPISecret,
+		OauthToken:       client.OAuthToken,
+		OauthTokenSecret: client.OAuthTokenSecret,
+	}
+
+	if err := saveFlickrConfig(cfg); err != nil {
+		fmt.Printf("Failed to save Flickr configuration: %s\n", err)
+		return
+	}
+
+	path, _ := configFilePath()
+	fmt.Printf("Flickr credentials saved to %s\n", path)
+}
+
+// promptOverwrite asks the user whether an existing configuration file
+// should be overwritten.
+func promptOverwrite(path string) bool {
+	reader := bufio.NewReader(os.Stdin)
+	fmt.Printf("A Flickr configuration already exists at %s. Overwrite it? [y/N]: ", path)
+	response, _ := reader.ReadString('\n')
+	response = strings.ToLower(strings.TrimSpace(response))
+	return response == "y" || response == "yes"
 }
 
 // initCmd represents the init command
@@ -112,8 +163,19 @@ var initCmd = &cobra.Command{
 	Short: "Initialize the Flickr API connection.",
 	Long:  "Initialize the Flickr API connection.",
 	Run: func(cmd *cobra.Command, args []string) {
-		fmt.Println("init called")
-		initDb()
+		path, err := configFilePath()
+		if err != nil {
+			fmt.Printf("Unable to determine configuration file location: %s\n", err)
+			return
+		}
+
+		if _, err := os.Stat(path); err == nil {
+			if !promptOverwrite(path) {
+				fmt.Println("Keeping existing configuration; aborting.")
+				return
+			}
+		}
+
 		initFlickr()
 	},
 }
